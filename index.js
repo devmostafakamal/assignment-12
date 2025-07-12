@@ -2,12 +2,44 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const app = express();
+const jwt = require("jsonwebtoken");
 const port = process.env.PORT || 3000;
 
 // middleware
 
-app.use(cors());
+app.use(
+  cors({
+    origin: "http://localhost:5173",
+    credentials: true,
+  })
+);
 app.use(express.json());
+
+const verifyJWT = (req, res, next) => {
+  console.log("✅ verifyJWT middleware is running...");
+  const authHeader = req.headers.authorization;
+  console.log("Authorization Header:", req.headers.authorization);
+  // এটা লগ করবে
+
+  if (!authHeader) {
+    console.log("No token provided");
+    return res.status(401).send({ message: "Unauthorized: No token provided" });
+  }
+
+  const token = authHeader.split(" ")[1]; // Bearer <token>
+  console.log("Extracted token:", token);
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+    if (err) {
+      console.log("Token verification failed:", err.message);
+      return res.status(403).send({ message: "Forbidden: Invalid token" });
+    }
+
+    console.log("Token verified. Decoded:", decoded);
+    req.user = decoded; // decoded contains email/role/etc.
+    next();
+  });
+};
 
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.qxaidbq.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
@@ -28,6 +60,8 @@ async function run() {
 
     const usersCollection = client.db("homeHunt").collection("users");
     const propertiesCollection = client.db("homeHunt").collection("properties");
+    const wishlistCollection = client.db("homeHunt").collection("wishlist");
+    const reviewsCollection = client.db("homeHunt").collection("reviews");
 
     // POST /jwt
     app.post("/jwt", async (req, res) => {
@@ -85,7 +119,7 @@ async function run() {
         const result = await propertiesCollection.insertOne({
           ...req.body,
           createdAt: new Date(),
-          status: "pending",
+          verificationStatus: "pending",
         });
 
         res.status(201).json({ success: true, insertedId: result.insertedId });
@@ -94,6 +128,57 @@ async function run() {
         res.status(500).json({ success: false, error: error.message });
       }
     });
+
+    app.post("/wishlist", verifyJWT, async (req, res) => {
+      const wishlistData = req.body;
+      const userEmail = req.user.email;
+
+      const result = await wishlistCollection.insertOne(wishlistData);
+      res.send(result);
+    });
+
+    app.get("/wishlist", verifyJWT, async (req, res) => {
+      const email = req.query.email;
+      console.log("req.query.email:", req.query.email);
+
+      if (!email || email !== req.user.email) {
+        return res.status(403).send({ error: "Access denied" });
+      }
+
+      try {
+        const result = await wishlistCollection
+          .find({ userEmail: email })
+          .toArray();
+        console.log(result);
+        res.send(result);
+      } catch (error) {
+        console.error("Error fetching wishlist:", error);
+        res.status(500).send({ error: "Failed to fetch wishlist" });
+      }
+    });
+
+    app.post("/reviews", verifyJWT, async (req, res) => {
+      const review = req.body;
+      const userRole = req.user.role;
+
+      if (userRole !== "user") {
+        return res
+          .status(403)
+          .json({ success: false, message: "Only users can post reviews" });
+      }
+
+      try {
+        const result = await reviewsCollection.insertOne(review);
+        res.status(201).json({
+          success: true,
+          message: "Review submitted",
+          insertedId: result.insertedId,
+        });
+      } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+      }
+    });
+
     // GET /api/properties
     app.get("/properties", async (req, res) => {
       try {
@@ -174,6 +259,21 @@ async function run() {
         }
 
         res.json(property);
+      } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+      }
+    });
+
+    // get reviews
+
+    app.get("/reviews/:propertyId", async (req, res) => {
+      const { propertyId } = req.params;
+      try {
+        const reviews = await reviewsCollection
+          .find({ propertyId })
+          .sort({ date: -1 })
+          .toArray();
+        res.json(reviews);
       } catch (error) {
         res.status(500).json({ success: false, error: error.message });
       }
