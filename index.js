@@ -11,31 +11,27 @@ app.use(
   cors({
     origin: "http://localhost:5173",
     credentials: true,
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 app.use(express.json());
 
 const verifyJWT = (req, res, next) => {
-  console.log("✅ verifyJWT middleware is running...");
   const authHeader = req.headers.authorization;
-  console.log("Authorization Header:", req.headers.authorization);
+
   // এটা লগ করবে
 
   if (!authHeader) {
-    console.log("No token provided");
     return res.status(401).send({ message: "Unauthorized: No token provided" });
   }
 
   const token = authHeader.split(" ")[1]; // Bearer <token>
-  console.log("Extracted token:", token);
 
   jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
     if (err) {
-      console.log("Token verification failed:", err.message);
       return res.status(403).send({ message: "Forbidden: Invalid token" });
     }
 
-    console.log("Token verified. Decoded:", decoded);
     req.user = decoded; // decoded contains email/role/etc.
     next();
   });
@@ -62,12 +58,13 @@ async function run() {
     const propertiesCollection = client.db("homeHunt").collection("properties");
     const wishlistCollection = client.db("homeHunt").collection("wishlist");
     const reviewsCollection = client.db("homeHunt").collection("reviews");
+    const offersCollection = client.db("homeHunt").collection("offers");
 
     // POST /jwt
     app.post("/jwt", async (req, res) => {
       const user = req.body; // { email }
       const token = jwt.sign(user, process.env.JWT_SECRET, {
-        expiresIn: "1h",
+        expiresIn: "24h",
       });
       res.send({ token });
     });
@@ -137,11 +134,12 @@ async function run() {
       res.send(result);
     });
 
-    app.get("/wishlist", verifyJWT, async (req, res) => {
+    app.get("/wishlist", async (req, res) => {
       const email = req.query.email;
-      console.log("req.query.email:", req.query.email);
+      // console.log("first");
+      // console.log("req.query.email:", req.query);
 
-      if (!email || email !== req.user.email) {
+      if (!email || email !== req.query.email) {
         return res.status(403).send({ error: "Access denied" });
       }
 
@@ -149,11 +147,34 @@ async function run() {
         const result = await wishlistCollection
           .find({ userEmail: email })
           .toArray();
-        console.log(result);
+
         res.send(result);
       } catch (error) {
         console.error("Error fetching wishlist:", error);
         res.status(500).send({ error: "Failed to fetch wishlist" });
+      }
+    });
+    // delete from wishlist
+    app.delete("/wishlist/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid ID" });
+        }
+
+        const result = await wishlistCollection.deleteOne({
+          _id: new ObjectId(id),
+        });
+
+        if (result.deletedCount === 0) {
+          return res.status(404).send({ message: "Item not found" });
+        }
+
+        res.send(result);
+      } catch (error) {
+        console.error("Wishlist delete error:", error.message);
+        res.status(500).send({ message: "Server error", error: error.message });
       }
     });
 
@@ -176,6 +197,147 @@ async function run() {
         });
       } catch (error) {
         res.status(500).json({ success: false, error: error.message });
+      }
+    });
+
+    // post offers
+
+    // app.post("/offers", async (req, res) => {
+    //   try {
+    //     const {
+    //       propertyId,
+    //       title,
+    //       location,
+    //       agentName,
+    //       offerAmount,
+    //       buyerEmail,
+    //       buyerName,
+    //       buyingDate,
+    //     } = req.body;
+
+    //     // if (req.user.email !== buyerEmail) {
+    //     //   return res.status(403).send({ message: "Unauthorized request" });
+    //     // }
+
+    //     // Fetch property to get actual price range
+    //     const property = await propertiesCollection.findOne({
+    //       _id: new ObjectId(propertyId),
+    //     });
+
+    //     if (!property) {
+    //       return res.status(404).send({ message: "Property not found" });
+    //     }
+
+    //     // Parse min and max price from priceRange string (e.g., "$40000 - $230000")
+    //     const [minPrice, maxPrice] = property.priceRange
+    //       .split("-")
+    //       .map((p) => parseFloat(p.replace(/[^\d.]/g, "")));
+
+    //     if (
+    //       isNaN(offerAmount) ||
+    //       offerAmount < minPrice ||
+    //       offerAmount > maxPrice
+    //     ) {
+    //       return res.status(400).send({
+    //         message: `Offer amount must be between $${minPrice} and $${maxPrice}`,
+    //       });
+    //     }
+
+    //     // Build offer object
+    //     const offerData = {
+    //       propertyId,
+    //       title,
+    //       location,
+    //       agentName,
+    //       offerAmount,
+    //       buyerEmail,
+    //       buyerName,
+    //       buyingDate,
+    //       status: "pending",
+    //     };
+    //     console.log(buyerEmail);
+    //     const result = await offersCollection.insertOne(offerData);
+    //     res.send({ insertedId: result.insertedId, message: "Offer submitted" });
+    //   } catch (error) {
+    //     console.error("Offer creation error:", error);
+    //     res.status(500).send({ message: "Internal server error" });
+    //   }
+    // });
+    // app.post("/offers", async (req, res) => {
+    //   try {
+    //     const offer = req.body;
+    //     const result = await offersCollection.insertOne(offer);
+    //     res.send({ insertedId: result.insertedId });
+    //   } catch (err) {
+    //     res.status(500).send({ message: "Server error", error: err.message });
+    //   }
+    // });
+    app.post("/offers", async (req, res) => {
+      try {
+        const {
+          propertyId,
+          title,
+          location,
+          agentName,
+          image,
+          offerAmount,
+          buyerEmail,
+          buyerName,
+          buyingDate,
+          status, // usually "pending"
+        } = req.body;
+
+        // Simple validation
+        if (
+          !propertyId ||
+          !title ||
+          !location ||
+          !agentName ||
+          !offerAmount ||
+          !buyerEmail ||
+          !buyerName ||
+          !buyingDate
+        ) {
+          return res.status(400).send({ message: "Missing required fields" });
+        }
+
+        // Create offer object
+        const newOffer = {
+          propertyId,
+          title,
+          location,
+          agentName,
+          image,
+          offerAmount,
+          buyerEmail,
+          buyerName,
+          buyingDate,
+          status: status || "pending", // default to "pending" if not provided
+          createdAt: new Date(),
+        };
+
+        const result = await offersCollection.insertOne(newOffer);
+        res.send({ insertedId: result.insertedId });
+      } catch (error) {
+        console.error("Offer insert error:", error.message);
+        res.status(500).send({ message: "Server error", error: error.message });
+      }
+    });
+    app.get("/offers", async (req, res) => {
+      try {
+        const buyerEmail = req.query.buyerEmail;
+        if (!buyerEmail) {
+          return res.status(400).send({ message: "buyerEmail is required" });
+        }
+        // verifyJWT middleware দিয়ে req.user থাকে, তার email এর সাথে মিল আছে কিনা চেক করো
+        // if (buyerEmail !== req.user.email) {
+        //   return res.status(403).send({ message: "Forbidden access" });
+        // }
+        const offers = await offersCollection.find({ buyerEmail }).toArray();
+        res.send(offers);
+      } catch (error) {
+        console.error("Get offers error:", error);
+        res.status(500).send({ message: "Failed to get offers" });
       }
     });
 
