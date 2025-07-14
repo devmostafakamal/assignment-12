@@ -5,6 +5,8 @@ const app = express();
 const jwt = require("jsonwebtoken");
 const port = process.env.PORT || 3000;
 
+const stripe = require("stripe")(process.env.PAYMENT_GATWAY_KEY);
+
 // middleware
 
 app.use(
@@ -59,6 +61,7 @@ async function run() {
     const wishlistCollection = client.db("homeHunt").collection("wishlist");
     const reviewsCollection = client.db("homeHunt").collection("reviews");
     const offersCollection = client.db("homeHunt").collection("offers");
+    const paymentsCollection = client.db("homeHunt").collection("payments");
 
     // POST /jwt
     app.post("/jwt", async (req, res) => {
@@ -178,17 +181,131 @@ async function run() {
       }
     });
 
-    app.post("/reviews", verifyJWT, async (req, res) => {
-      const review = req.body;
-      const userRole = req.user.role;
+    // 📁 routes/paymentRoutes.js
+    app.post("/create-payment-intent", async (req, res) => {
+      const { amountInCents } = req.body;
 
-      if (userRole !== "user") {
-        return res
-          .status(403)
-          .json({ success: false, message: "Only users can post reviews" });
+      try {
+        const paymentIntent = await stripe.paymentIntents.create({
+          amount: amountInCents,
+          currency: "usd",
+          payment_method_types: ["card"],
+        });
+
+        res.send({ clientSecret: paymentIntent.client_secret });
+      } catch (error) {
+        res.status(500).send({ error: error.message });
+      }
+    });
+
+    app.get("/payments/:offerId", async (req, res) => {
+      const offerId = req.params.offerId;
+      try {
+        const offer = await offersCollection.findOne({
+          _id: new ObjectId(offerId),
+        });
+
+        if (!offer) return res.status(404).send({ message: "Offer not found" });
+
+        res.send(offer);
+      } catch (error) {
+        res.status(500).send({ error: error.message });
+      }
+    });
+    app.post("/payments", async (req, res) => {
+      const {
+        offerId,
+        transactionId,
+        amount,
+        email,
+        userName,
+        status = "bought",
+      } = req.body;
+
+      try {
+        // 1. Save payment record
+        const paymentResult = await paymentsCollection.insertOne({
+          offerId,
+          transactionId,
+          amount,
+          email,
+          userName,
+          status,
+          paidAt: new Date(),
+        });
+
+        // 2. Update offer status & transaction ID
+        const offerUpdate = await offersCollection.updateOne(
+          { _id: new ObjectId(offerId) },
+          {
+            $set: {
+              status: "bought",
+              transactionId: transactionId,
+            },
+          }
+        );
+
+        res.send({ paymentResult, offerUpdate });
+      } catch (error) {
+        res.status(500).send({ error: error.message });
+      }
+    });
+    // sold property by email
+    app.get("/sold-properties", async (req, res) => {
+      const agentEmail = req.query.agentEmail?.toLowerCase();
+
+      if (!agentEmail) {
+        return res.status(400).send({ error: "agentEmail is required" });
       }
 
       try {
+        const pipeline = [
+          {
+            $match: {
+              agentEmail: agentEmail,
+              status: "bought", // only sold offers
+            },
+          },
+          {
+            $lookup: {
+              from: "properties", // join to get property info if needed (optional)
+              localField: "propertyId",
+              foreignField: "_id",
+              as: "propertyInfo",
+            },
+          },
+          {
+            $unwind: {
+              path: "$propertyInfo",
+              preserveNullAndEmptyArrays: true, // optional
+            },
+          },
+          {
+            $project: {
+              _id: 1,
+              title: 1, // from offers
+              location: 1, // from offers
+              buyerEmail: 1,
+              buyerName: 1,
+              soldPrice: "$offerAmount",
+              transactionId: 1,
+              paidAt: "$createdAt",
+            },
+          },
+        ];
+
+        const result = await offersCollection.aggregate(pipeline).toArray();
+        res.send(result);
+      } catch (error) {
+        console.error("Error fetching sold properties:", error);
+        res.status(500).send({ error: "Internal Server Error" });
+      }
+    });
+
+    app.post("/reviews", async (req, res) => {
+      const review = req.body;
+      try {
+        review.createdAt = new Date();
         const result = await reviewsCollection.insertOne(review);
         res.status(201).json({
           success: true,
@@ -197,6 +314,120 @@ async function run() {
         });
       } catch (error) {
         res.status(500).json({ success: false, error: error.message });
+      }
+    });
+
+    app.get("/reviews", async (req, res) => {
+      const email = req.query.email;
+
+      // if (!email || email !== req.user.email) {
+      //   return res.status(403).send({ message: "Forbidden" });
+      // }
+
+      const result = await reviewsCollection
+        .find({ reviewerEmail: email })
+        .toArray();
+      res.send(result);
+    });
+
+    app.delete("/reviews/:id", async (req, res) => {
+      const id = req.params.id;
+      const email = req.query.email;
+      const review = await reviewsCollection.findOne({ _id: new ObjectId(id) });
+
+      if (!review) {
+        return res.status(404).send({ message: "Review not found" });
+      }
+
+      if (review.reviewerEmail !== req.query.email) {
+        return res.status(403).send({ message: "Forbidden: Not your review" });
+      }
+
+      const result = await reviewsCollection.deleteOne({
+        _id: new ObjectId(id),
+      });
+      res.send(result);
+    });
+
+    // have to be later verifyJWT, verifyAdmin,
+    app.get("/reviews/all", async (req, res) => {
+      try {
+        const reviews = await reviewsCollection.find().toArray();
+        res.send(reviews);
+      } catch (error) {
+        res.status(500).send({ message: "Failed to fetch reviews", error });
+      }
+    });
+
+    // get all offers from user
+
+    app.get("/offers/agent", async (req, res) => {
+      const email = req.query.email;
+      const result = await offersCollection
+        .find({ agentEmail: email })
+        .toArray(); // if you stored agentEmail
+      res.send(result);
+    });
+
+    app.patch("/offers/accept/:id", async (req, res) => {
+      const offerId = req.params.id;
+      const { propertyId } = req.body;
+
+      const accepted = await offersCollection.updateOne(
+        { _id: new ObjectId(offerId) },
+        { $set: { status: "accepted" } }
+      );
+
+      const rejected = await offersCollection.updateMany(
+        { propertyId, _id: { $ne: new ObjectId(offerId) } },
+        { $set: { status: "rejected" } }
+      );
+
+      res.send({ accepted, rejected });
+    });
+
+    app.patch("/offers/reject/:id", async (req, res) => {
+      const offerId = req.params.id;
+      const result = await offersCollection.updateOne(
+        { _id: new ObjectId(offerId) },
+        { $set: { status: "rejected" } }
+      );
+      res.send(result);
+    });
+    app.patch("/offers/:id/accept", async (req, res) => {
+      const offerId = req.params.id;
+
+      try {
+        // 1️⃣ First, accept the selected offer
+        const acceptedOffer = await offersCollection.findOneAndUpdate(
+          { _id: new ObjectId(offerId) },
+          { $set: { status: "accepted" } },
+          { returnDocument: "after" }
+        );
+
+        if (!acceptedOffer.value) {
+          return res.status(404).send({ message: "Offer not found" });
+        }
+
+        const propertyId = acceptedOffer.value.propertyId;
+
+        // 2️⃣ Reject all other offers for the same property
+        const rejectResult = await offersCollection.updateMany(
+          {
+            propertyId: propertyId,
+            _id: { $ne: new ObjectId(offerId) }, // ✅ Don't reject the accepted one
+          },
+          { $set: { status: "rejected" } }
+        );
+
+        res.send({
+          message: "Offer accepted and other offers rejected.",
+          acceptedOffer: acceptedOffer.value,
+          rejectedCount: rejectResult.modifiedCount,
+        });
+      } catch (error) {
+        console.error("Error accepting offer:", error);
+        res.status(500).send({ message: "Server error" });
       }
     });
 
@@ -283,6 +514,7 @@ async function run() {
           offerAmount,
           buyerEmail,
           buyerName,
+          agentEmail,
           buyingDate,
           status, // usually "pending"
         } = req.body;
@@ -311,6 +543,7 @@ async function run() {
           offerAmount,
           buyerEmail,
           buyerName,
+          agentEmail,
           buyingDate,
           status: status || "pending", // default to "pending" if not provided
           createdAt: new Date(),
